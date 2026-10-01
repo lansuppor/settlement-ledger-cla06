@@ -18,7 +18,16 @@ def connect() -> sqlite3.Connection:
 def migrate() -> None:
     conn = connect()
     try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations("
+            "name TEXT PRIMARY KEY, "
+            "applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))"
+        )
+        applied = {row["name"] for row in conn.execute("SELECT name FROM schema_migrations").fetchall()}
         for sql_file in sorted(MIGRATIONS_DIR.glob("*.sql")):
+            if sql_file.name in applied:
+                continue
             conn.executescript(sql_file.read_text(encoding="utf-8"))
+            conn.execute("INSERT INTO schema_migrations(name) VALUES(?)", (sql_file.name,))
     finally:
         conn.close()
