@@ -10,6 +10,8 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 写事务串行时等待锁而非立即 SQLITE_BUSY，支撑收款/冲正并发。
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 def migrate() -> None:
