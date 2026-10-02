@@ -62,10 +62,11 @@ def _insert_timeline_event(
 
     每次业务请求至多追加一条；timeline_events.id 全库单调递增，
     同一订单内按 id 排列即业务发生顺序，跨环节可稳定排序与重放。
+    返回新追加条目的全库单调序号。
     """
     before = before or {}
     after = after or {}
-    conn.execute(
+    cursor = conn.execute(
         "INSERT INTO timeline_events"
         "(tenant, order_id, stage, result, amount_cents, currency, paid_after, reconciled_after, "
         "reason, reject_reason, before_order_id, before_amount_cents, before_currency, "
@@ -79,6 +80,7 @@ def _insert_timeline_event(
             request_id,
         ),
     )
+    return cursor.lastrowid
 
 def insert_conn(
     conn: sqlite3.Connection,
@@ -88,15 +90,23 @@ def insert_conn(
     currency: str,
     request_id: str | None = None,
 ) -> None:
-    """在调用方给定的连接/事务内受理订单，并写入受理环节的时间线事件。"""
+    """在调用方给定的连接/事务内受理订单，并写入受理环节的时间线事件。
+
+    accept_seq 取受理时间线条目的全库单调序号，先落订单行（冲突时在写时间线前
+    抛出，不产生悬挂留痕），再回填 accept_seq，保证后续条件检索按受理顺序排列。
+    """
     conn.execute(
         "INSERT INTO orders(tenant, order_id, amount_cents, paid_cents, currency, status) "
         "VALUES(?,?,?,0,?,'accepted')",
         (tenant, order_id, amount_cents, currency),
     )
-    _insert_timeline_event(
+    accept_seq = _insert_timeline_event(
         conn, tenant, order_id, STAGE_ACCEPTANCE, RESULT_APPLIED,
         amount_cents=amount_cents, currency=currency, request_id=request_id,
+    )
+    conn.execute(
+        "UPDATE orders SET accept_seq=? WHERE tenant=? AND order_id=?",
+        (accept_seq, tenant, order_id),
     )
 
 def get_conn(conn: sqlite3.Connection, tenant: str, order_id: str) -> dict | None:

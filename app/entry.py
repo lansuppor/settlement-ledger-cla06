@@ -8,6 +8,7 @@ from app.store import orders
 from app.store.db import connect, migrate
 from app.usecase import batch as batch_uc
 from app.usecase import orders as orders_uc
+from app.usecase import search as search_uc
 
 app = FastAPI(title="settlement-ledger")
 
@@ -84,6 +85,35 @@ def create_order(body: OrderIn, idempotency_key: str = Header(default="", alias=
 def import_orders(body: str = Body(default="", media_type="text/plain")) -> dict:
     # 逗号分隔文本按行受理：部分成功、逐行结论、可安全重试；不携带请求标识
     return batch_uc.import_orders(body)
+
+@app.get("/orders")
+def search_orders(
+    x_tenant: str = Header(default=""),
+    status: str | None = None,
+    currency: str | None = None,
+    min_amount: str | None = None,
+    max_amount: str | None = None,
+    limit: str | None = None,
+    cursor: str | None = None,
+) -> dict:
+    # 按订单集合的条件检索：状态/币种/金额上下限均可选，不给出即不限制。
+    # 查询参数以原始字符串接收，所有非法取值（条数越界、币种/状态不支持、
+    # 金额非整数、区间倒置、游标无效）统一由用例返回 400 并说明原因。
+    # 租户仍通过 X-Tenant 传入，缺少租户与既有读取入口一样返回 400。
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        return search_uc.search_orders(
+            x_tenant,
+            status_raw=status,
+            currency_raw=currency,
+            min_amount_raw=min_amount,
+            max_amount_raw=max_amount,
+            limit_raw=limit,
+            cursor=cursor,
+        )
+    except search_uc.InvalidQuery as error:
+        raise HTTPException(status_code=400, detail=str(error))
 
 @app.get("/orders/{order_id}")
 def read_order(order_id: str, x_tenant: str = Header(default="")) -> dict:
