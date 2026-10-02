@@ -1,11 +1,12 @@
 import argparse
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
 from app.store import orders
 from app.store.db import connect, migrate
+from app.usecase import imports as imports_uc
 from app.usecase import orders as orders_uc
 
 app = FastAPI(title="settlement-ledger")
@@ -65,6 +66,19 @@ def create_order(body: OrderIn, idempotency_key: str = Header(default="", alias=
     if result.status_code != 201:
         raise HTTPException(status_code=result.status_code, detail=result.body.get("detail"))
     return result.body
+
+@app.post("/orders/import")
+async def import_orders(request: Request) -> dict:
+    """批量导入订单：请求体为逗号分隔的订单行文本（text/plain），逐行受理。
+
+    批量导入不携带请求标识；每行独立定论，返回计数闭合的导入结果。
+    """
+    raw = await request.body()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="body must be UTF-8 text") from None
+    return imports_uc.import_orders_text(text)
 
 @app.get("/orders/{order_id}")
 def read_order(order_id: str, x_tenant: str = Header(default="")) -> dict:

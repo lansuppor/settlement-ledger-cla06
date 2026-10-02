@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额、对已登记收款进行冲正、对收款进行对账核销；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单（含逗号分隔文本的批量导入）、按标识读取订单、登记收款并核对未收金额、对已登记收款进行冲正、对收款进行对账核销；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 受理订单、登记收款、收款冲正与核销支持基于请求标识（`Idempotency-Key` 请求头）的幂等：网络重试、重复点击、并发重复提交都不会造成重复受理、重复收款、重复冲正或重复核销。
 
@@ -108,6 +108,35 @@ curl -i -X POST http://127.0.0.1:8000/orders/ord-1/reversals \
   -H 'Content-Type: application/json' -H 'X-Tenant: tenant-a' \
   -d '{"amount_cents":300}'
 # => 409 "reversal would make paid amount less than reconciled amount"（与超过已收的 409 原因不同）
+
+# 17) 批量导入订单：请求体为逗号分隔的订单行文本（text/plain），每行 租户,订单标识,金额,币种
+printf 'tenant,order_id,amount_cents,currency\ntenant-a,bulk-1,1200,CNY\ntenant-a,bulk-2,800,CNY\ntenant-b,bulk-3,4500,USD\ntenant-a,bulk-4,-3,CNY\ntenant-a,bulk-5,100,GBP\ntenant-a,broken-line\n' > /tmp/batch.txt
+curl -s -X POST http://127.0.0.1:8000/orders/import \
+  -H 'Content-Type: text/plain' --data-binary @/tmp/batch.txt
+# => {"submitted":6,"succeeded":3,"skipped":0,"failed":3,
+#     "failures":[{"line":5,"order_id":"bulk-4","reason":"invalid_amount",...},
+#                 {"line":6,"order_id":"bulk-5","reason":"unsupported_currency",...},
+#                 {"line":7,"order_id":"broken-line","reason":"invalid_line",...}],
+#     "skipped_lines":[]}
+#    计数闭合：submitted = succeeded + skipped + failed；表头行与空行不计入提交行数
+
+# 18) 重试同一份输入是安全的：成功过的行按跳过处理，失败行按原结论重新判定，不产生重复订单
+curl -s -X POST http://127.0.0.1:8000/orders/import \
+  -H 'Content-Type: text/plain' --data-binary @/tmp/batch.txt
+# => {"submitted":6,"succeeded":0,"skipped":3,"failed":3,...}
+#    skipped_lines 逐行给出 reason=order_already_exists；failures 与首次一致
+
+# 19) 同租户同订单标识但金额/币种不一致 —— 该行失败且已有订单不变
+printf 'tenant-a,bulk-1,999,CNY\n' | curl -s -X POST http://127.0.0.1:8000/orders/import \
+  -H 'Content-Type: text/plain' --data-binary @-
+# => failures[0].reason = "order_content_mismatch"；bulk-1 仍为 1200 CNY
+
+# 20) 导入成功的订单可按标识读取，收款/冲正/核销及其 Idempotency-Key 规则照常适用
+curl -s http://127.0.0.1:8000/orders/bulk-1 -H 'X-Tenant: tenant-a'
+curl -s -X POST http://127.0.0.1:8000/orders/bulk-1/payments \
+  -H 'Content-Type: application/json' -H 'X-Tenant: tenant-a' \
+  -H 'Idempotency-Key: pay-bulk-1' \
+  -d '{"amount_cents":200}'
 ```
 
 重启服务后再次提交上述相同请求，结论与重启前一致：重复请求仍回放首次结果，冲突请求仍被拒绝；已生效的冲正、核销及其留痕继续保留。
@@ -123,6 +152,11 @@ curl -i -X POST http://127.0.0.1:8000/orders/ord-1/reversals \
   - 成功返回 201 与订单对象；参数不合法返回 400。
   - 携带 `Idempotency-Key` 时：同租户同标识的重复提交返回与首次一致的状态码与响应体，不重复受理；标识相同但业务内容（订单标识、金额、币种）或操作类型不同返回 422 且不改变任何数据。
   - 不携带 `Idempotency-Key` 时：同一租户重复受理返回 409（原有行为不变）。
+- `POST /orders/import`：批量导入订单。请求体为 UTF-8 文本（`Content-Type: text/plain`），每行一条 `租户,订单标识,金额,币种` 四个逗号分隔字段；空行与首个表头行（`tenant,order_id,amount_cents,currency`）不计入提交行数。
+  - 逐行校验并独立事务受理：任一行的问题不影响其他行；导入中途失败时已受理的行保持生效，重试同一份输入安全（成功行跳过、失败行重新判定、不产生重复订单）。
+  - 返回 200 与计数闭合的结果：`submitted = succeeded + skipped + failed`；`failures` 逐行给出物理行号（从 1 开始）、订单标识（若能解析出）与可区分的原因码，`skipped_lines` 给出被跳过行的行号与原因。
+  - 失败/跳过原因码：`invalid_line`（字段缺失或格式错误）、`invalid_amount`（金额不是正整数）、`unsupported_currency`（币种不受支持）、`order_already_exists`（同租户同订单标识且金额币种完全一致，按跳过处理，不改写已有订单）、`order_content_mismatch`（同租户同订单标识但金额或币种与已有订单不一致，按失败处理，已有数据不变）。
+  - 导入写入的订单不携带请求标识；导入完成后可按标识读取订单，收款、冲正、核销及其 `Idempotency-Key` 幂等规则照常适用。
 - `GET /orders/{order_id}`：按标识读取订单。租户通过请求头 `X-Tenant` 传入；不存在返回 404；跨租户读取返回 404（不泄漏对象是否存在）。
 - `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`。
   - 携带 `Idempotency-Key` 时：同租户同标识的重复提交回放首次结果（含首次的 200/409/404 结论），收款金额不重复累加；标识相同但收款金额或目标订单不同返回 422 且不登记收款。
@@ -155,5 +189,5 @@ curl -i -X POST http://127.0.0.1:8000/orders/ord-1/reversals \
 
 - 单进程运行，单库写入；同标识并发通过 SQLite `BEGIN IMMEDIATE` 写事务串行化，库级锁保证只有一次请求产生业务效果。
 - 租户通过请求头声明，未接入真实身份提供方。
-- 无缓存层；批量导入只支持小样本同步方式。
+- 无缓存层；批量导入为同步逐行受理，适合中小批量样本。
 - 收款支持多次登记、收款冲正与对账核销；未实现分期单据、主动退款与自动对账。
