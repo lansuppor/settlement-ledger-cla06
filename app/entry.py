@@ -1,12 +1,16 @@
 import argparse
-from fastapi import FastAPI, Header, HTTPException, Response
+
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from app.config import tenant_header
+
+from app.rules import order_rules
 from app.store import orders
 from app.store.db import connect, migrate
-from app.rules import order_rules
+from app.usecase import orders as orders_uc
 
 app = FastAPI(title="settlement-ledger")
+
+IDEMPOTENCY_HEADER = "Idempotency-Key"
 
 class OrderIn(BaseModel):
     tenant: str = Field(min_length=1)
@@ -27,18 +31,34 @@ def health() -> dict:
     return {"status": "ok"}
 
 @app.post("/orders", status_code=201)
-def create_order(body: OrderIn) -> dict:
-    order_rules.assert_currency(body.currency)
+def create_order(body: OrderIn, idempotency_key: str = Header(default="", alias=IDEMPOTENCY_HEADER)) -> dict:
     try:
-        orders.insert(body.tenant, body.order_id, body.amount_cents, body.currency)
-    except Exception as error:
-        if "UNIQUE" in str(error):
-            raise HTTPException(status_code=409, detail="order already accepted")
-        raise
-    return orders.get(body.tenant, body.order_id)
+        order_rules.assert_currency(body.currency)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    if not idempotency_key:
+        # 未携带请求标识：保持原有处理方式
+        try:
+            orders.insert(body.tenant, body.order_id, body.amount_cents, body.currency)
+        except Exception as error:
+            if "UNIQUE" in str(error):
+                raise HTTPException(status_code=409, detail="order already accepted")
+            raise
+        return orders.get(body.tenant, body.order_id)
+
+    try:
+        result = orders_uc.accept_order(
+            body.tenant, idempotency_key, body.order_id, body.amount_cents, body.currency
+        )
+    except orders_uc.IdempotentConflict as error:
+        raise HTTPException(status_code=422, detail=str(error))
+    if result.status_code != 201:
+        raise HTTPException(status_code=result.status_code, detail=result.body.get("detail"))
+    return result.body
 
 @app.get("/orders/{order_id}")
-def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) -> dict:
+def read_order(order_id: str, x_tenant: str = Header(default="")) -> dict:
     tenant = x_tenant or ""
     if not tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
@@ -48,16 +68,32 @@ def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) ->
     return order
 
 @app.post("/orders/{order_id}/payments")
-def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="")) -> dict:
+def add_payment(
+    order_id: str,
+    body: PaymentIn,
+    x_tenant: str = Header(default=""),
+    idempotency_key: str = Header(default="", alias=IDEMPOTENCY_HEADER),
+) -> dict:
     if not x_tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
+
+    if not idempotency_key:
+        # 未携带请求标识：保持原有处理方式
+        try:
+            order = orders.add_payment(x_tenant, order_id, body.amount_cents)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error))
+        if order is None:
+            raise HTTPException(status_code=404, detail="order not found")
+        return order
+
     try:
-        order = orders.add_payment(x_tenant, order_id, body.amount_cents)
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error))
-    if order is None:
-        raise HTTPException(status_code=404, detail="order not found")
-    return order
+        result = orders_uc.register_payment(x_tenant, idempotency_key, order_id, body.amount_cents)
+    except orders_uc.IdempotentConflict as error:
+        raise HTTPException(status_code=422, detail=str(error))
+    if result.status_code != 200:
+        raise HTTPException(status_code=result.status_code, detail=result.body.get("detail"))
+    return result.body
 
 def main() -> None:
     parser = argparse.ArgumentParser()
