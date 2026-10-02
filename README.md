@@ -1,8 +1,8 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、批量导入订单（逗号分隔文本按行受理）、登记收款并核对未收金额、对已登记收款进行冲正、对收款进行对账核销；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、批量导入订单（逗号分隔文本按行受理）、登记收款并核对未收金额、对已登记收款进行冲正、对收款进行对账核销、对已受理但尚未发生任何收款/冲正/核销的订单进行更正（修正录错的金额、币种或订单标识）；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
-受理订单、登记收款、收款冲正与核销支持基于请求标识（`Idempotency-Key` 请求头）的幂等：网络重试、重复点击、并发重复提交都不会造成重复受理、重复收款、重复冲正或重复核销。
+受理订单、登记收款、收款冲正、核销与订单更正支持基于请求标识（`Idempotency-Key` 请求头）的幂等：网络重试、重复点击、并发重复提交都不会造成重复受理、重复收款、重复冲正、重复核销或重复更正。
 
 ## 环境与安装
 
@@ -11,7 +11,7 @@
 
 ## 启动
 
-- 启动时会自动执行 `migrations/` 下的建表迁移（按版本记录，只执行一次；含幂等记录表与收款/冲正/核销留痕表）：
+- 启动时会自动执行 `migrations/` 下的建表迁移（按版本记录，只执行一次；含幂等记录表与收款/冲正/核销/更正留痕表）：
   `python3 -m app.entry --port 8000`
 - 只做迁移不启动：`python3 -m app.entry --migrate`
 - 健康检查：`GET /health`
@@ -128,9 +128,47 @@ curl -s http://127.0.0.1:8000/orders/bulk-1 -H 'X-Tenant: tenant-a'
 curl -s -X POST http://127.0.0.1:8000/orders/bulk-1/payments \
   -H 'Content-Type: application/json' -H 'X-Tenant: tenant-a' \
   -H 'Idempotency-Key: pay-bulk-1' -d '{"amount_cents":200}'
+
+# 20) 更正订单：仅受理后尚未产生任何收款/冲正/核销的订单可更正（修正金额、币种、标识）
+#     先受理一张干净订单，再携带 Idempotency-Key 更正为新标识/金额/币种
+curl -s -X POST http://127.0.0.1:8000/orders \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: fix-acc' \
+  -d '{"tenant":"tenant-a","order_id":"oops-1","amount_cents":500,"currency":"CNY"}'
+curl -s -X POST http://127.0.0.1:8000/orders/oops-1/corrections \
+  -H 'Content-Type: application/json' -H 'X-Tenant: tenant-a' \
+  -H 'Idempotency-Key: fix-1' \
+  -d '{"order_id":"ord-fixed","amount_cents":480,"currency":"USD"}'
+# => {"order_id":"ord-fixed","amount_cents":480,"currency":"USD","paid_cents":0,
+#     "reconciled_cents":0,"status":"accepted","outstanding_cents":480}
+
+# 21) 更正成功后按新标识可读，旧标识按不存在处理；同标识重复提交回放首次结果
+curl -s http://127.0.0.1:8000/orders/ord-fixed -H 'X-Tenant: tenant-a'
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/orders/oops-1 -H 'X-Tenant: tenant-a'  # => 404
+curl -s -X POST http://127.0.0.1:8000/orders/oops-1/corrections \
+  -H 'Content-Type: application/json' -H 'X-Tenant: tenant-a' -H 'Idempotency-Key: fix-1' \
+  -d '{"order_id":"ord-fixed","amount_cents":480,"currency":"USD"}'   # 回放首次响应，不重复更正
+
+# 22) 更正被拒绝的情形（均为 409，detail 原因可区分，且订单与留痕不被改动）
+#   - 已有收款/冲正/核销任一业务事实（哪怕收款后已全额冲正、paid_cents 归零）
+curl -i -X POST http://127.0.0.1:8000/orders/bulk-1/corrections \
+  -H 'Content-Type: application/json' -H 'X-Tenant: tenant-a' \
+  -d '{"order_id":"bulk-1","amount_cents":1200,"currency":"CNY"}'
+#   => 409 "order already has payment, reversal or reconciliation facts and cannot be corrected"
+#   - 金额 <= 0 / 更正后标识为空 / 币种不受支持 / 同租户新标识已被其他订单占用
+curl -i -X POST http://127.0.0.1:8000/orders/ord-fixed/corrections \
+  -H 'Content-Type: application/json' -H 'X-Tenant: tenant-a' \
+  -d '{"order_id":"ord-fixed","amount_cents":0,"currency":"USD"}'      # correction amount must be greater than zero
+#   订单不存在（含跨租户）为 404；幂等标识被用于不同更正内容或其他操作类型为 422
+
+# 23) 按订单读出每次更正（含被拒绝的更正）的更正前/后内容与结果，按发生顺序
+curl -s http://127.0.0.1:8000/orders/ord-fixed/corrections -H 'X-Tenant: tenant-a'
+# => {"order_id":"ord-fixed","corrections":[{"before_order_id":"oops-1",
+#     "before_amount_cents":500,"before_currency":"CNY",
+#     "after_order_id":"ord-fixed","after_amount_cents":480,"after_currency":"USD",
+#     "result":"applied","reject_reason":null,"request_id":"fix-1", ...}]}
 ```
 
-重启服务后再次提交上述相同请求，结论与重启前一致：重复请求仍回放首次结果，冲突请求仍被拒绝；已生效的冲正、核销及其留痕继续保留。
+重启服务后再次提交上述相同请求，结论与重启前一致：重复请求仍回放首次结果，冲突请求仍被拒绝；已生效的冲正、核销、更正及其留痕继续保留。
 
 ## 测试
 
@@ -167,6 +205,13 @@ curl -s -X POST http://127.0.0.1:8000/orders/bulk-1/payments \
   - 订单不存在或跨租户访问返回 404（跨租户不泄漏订单是否存在）。
   - 携带 `Idempotency-Key` 时：同租户同标识的重复核销回放首次结果（含首次的 200/409/404 结论），不重复累加核销金额；标识相同但核销金额、目标订单或操作类型不同返回 422 且不改变任何数据。
 - `GET /orders/{order_id}/reconciliations`：按发生顺序读出该订单的每笔核销留痕，字段含 `amount_cents`、`result`、`reconciled_after`、`request_id`、`created_at`；不存在或跨租户返回 404。
+- `POST /orders/{order_id}/corrections`：更正已受理订单。请求字段 `order_id`（更正后的订单标识）、`amount_cents`、`currency`；租户通过请求头 `X-Tenant` 传入，路径中的 `order_id` 为更正前标识。
+  - 成功返回 200 与按更正后内容读取的订单对象，订单按新标识可读（旧标识随后按不存在处理）；同时写一条 `result=applied` 的更正留痕，记录更正前后的标识/金额/币种。
+  - 只有尚未产生任何收款、冲正、核销业务事实的订单可更正：`paid_cents`、`reconciled_cents` 均为 0 且没有任何收款、冲正、核销留痕（收款后全额冲正使已收归零，留痕仍在，仍不可更正）。
+  - 非法或不被允许的更正返回 409，`detail` 区分具体原因：`correction amount must be greater than zero`（金额 ≤ 0）、`correction order id must not be empty`（更正后标识为空）、`unsupported currency: <币种>`（币种不受支持）、`order already has payment, reversal or reconciliation facts and cannot be corrected`（已存在任一业务事实）、`correction target order id already exists`（同租户下新标识已属于其他订单；跨租户同名不冲突）；被拒绝时订单金额、币种、标识、状态与全部既有留痕保持不变，但会固化一条 `result=rejected` 的更正留痕。
+  - 订单不存在或跨租户访问返回 404（跨租户不泄漏订单是否存在，且不写留痕）。
+  - 携带 `Idempotency-Key` 时：同租户同标识的重复更正回放首次结果（含首次的 200/409/404 结论，即使订单已改名、重复请求仍以路径中的旧标识发起也回放首次响应），不重复更正；标识相同但更正后的订单标识/金额/币种、目标订单或操作类型（受理/收款/冲正/核销/更正）不同返回 422 且不改变任何数据。未携带请求标识时按普通单次操作处理（每次独立判定并留痕）。
+- `GET /orders/{order_id}/corrections`：按发生顺序读出该订单的每笔更正留痕（含生效与被拒绝），字段含更正前后的 `before_order_id`/`before_amount_cents`/`before_currency` 与 `after_order_id`/`after_amount_cents`/`after_currency`、`result`（`applied`/`rejected`）、`reject_reason`、`request_id`、`created_at`；订单被改名后按新标识仍可读出其全部更正留痕，复用了旧标识的新订单读不到前者留痕；不存在或跨租户返回 404。
 - `GET /health`：返回服务与数据库状态。
 
 幂等作用域为「租户 + 请求标识」：不同租户使用相同请求标识互不影响；幂等记录持久化在数据库中，服务重启后继续有效。
@@ -181,4 +226,4 @@ curl -s -X POST http://127.0.0.1:8000/orders/bulk-1/payments \
 - 单进程运行，单库写入；同标识并发通过 SQLite `BEGIN IMMEDIATE` 写事务串行化，库级锁保证只有一次请求产生业务效果。
 - 租户通过请求头声明，未接入真实身份提供方。
 - 无缓存层；批量导入为同步逐行受理，适合中小批量样本。
-- 收款支持多次登记、收款冲正与对账核销；未实现分期单据、主动退款与自动对账。
+- 收款支持多次登记、收款冲正与对账核销；已受理且尚无任何收款/冲正/核销事实的订单支持更正金额、币种与标识；未实现分期单据、主动退款与自动对账。

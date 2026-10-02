@@ -14,6 +14,7 @@ SCOPE_ORDER_CREATE = "order_create"
 SCOPE_PAYMENT = "payment"
 SCOPE_REVERSAL = "reversal"
 SCOPE_RECONCILIATION = "reconciliation"
+SCOPE_CORRECTION = "order_correction"
 
 
 class IdempotentConflict(Exception):
@@ -160,6 +161,50 @@ def reconcile_order(tenant: str, request_id: str, order_id: str, amount_cents: i
                 status_code, body = 409, {"detail": str(error)}
             idempotency.insert_conn(
                 conn, tenant, request_id, SCOPE_RECONCILIATION, request_hash, order_id,
+                status_code, json.dumps(body, ensure_ascii=False),
+            )
+            _finish(conn)
+        except Exception:
+            _abort(conn)
+            raise
+    finally:
+        conn.close()
+    return IdemResult(status_code, body, replay=False)
+
+
+def correct_order(
+    tenant: str,
+    request_id: str,
+    order_id: str,
+    new_order_id: str,
+    new_amount_cents: int,
+    new_currency: str,
+) -> IdemResult:
+    request_hash = _fingerprint((SCOPE_CORRECTION, order_id, new_order_id, new_amount_cents, new_currency))
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = idempotency.get_conn(conn, tenant, request_id)
+        if existing is not None:
+            _finish(conn)
+            if existing["scope"] != SCOPE_CORRECTION or existing["request_hash"] != request_hash:
+                raise IdempotentConflict("request id was already used with different request content")
+            return IdemResult(existing["status_code"], json.loads(existing["response_json"]), replay=True)
+
+        try:
+            # ValueError（业务拒绝/输入非法）时 correct_conn 已在同事务写入 rejected
+            # 更正留痕；该留痕随幂等记录一并提交，拒绝结论被固化并可按订单读出。
+            try:
+                body = orders.correct_conn(
+                    conn, tenant, order_id, new_order_id, new_amount_cents, new_currency, request_id
+                )
+                status_code = 200
+            except LookupError:
+                status_code, body = 404, {"detail": "order not found"}
+            except ValueError as error:
+                status_code, body = 409, {"detail": str(error)}
+            idempotency.insert_conn(
+                conn, tenant, request_id, SCOPE_CORRECTION, request_hash, order_id,
                 status_code, json.dumps(body, ensure_ascii=False),
             )
             _finish(conn)
