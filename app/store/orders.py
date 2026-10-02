@@ -8,6 +8,14 @@ ORDER_COLUMNS = "tenant, order_id, amount_cents, paid_cents, reconciled_cents, c
 RESULT_APPLIED = "applied"
 RESULT_REJECTED = "rejected"
 
+# 时间线环节：受理、收款、冲正、核销、更正、退款
+STAGE_ACCEPTANCE = "acceptance"
+STAGE_PAYMENT = "payment"
+STAGE_REVERSAL = "reversal"
+STAGE_RECONCILIATION = "reconciliation"
+STAGE_CORRECTION = "correction"
+STAGE_REFUND = "refund"
+
 # 更正被业务规则拒绝（订单已有业务事实，或同租户新标识已存在）：
 # 拒绝结论已写入更正留痕，调用方据此返回 409。
 class CorrectionRejected(ValueError):
@@ -24,12 +32,61 @@ _FACT_TABLES = ("payment_records", "reversal_records", "reconciliation_records",
 def _row_to_order(row: sqlite3.Row) -> dict:
     return {**dict(row), "outstanding_cents": row["amount_cents"] - row["paid_cents"]}
 
-def insert_conn(conn: sqlite3.Connection, tenant: str, order_id: str, amount_cents: int, currency: str) -> None:
+def _insert_timeline_event(
+    conn: sqlite3.Connection,
+    tenant: str,
+    order_id: str,
+    stage: str,
+    result: str,
+    *,
+    amount_cents: int | None = None,
+    paid_after: int | None = None,
+    reconciled_after: int | None = None,
+    reject_reason: str | None = None,
+    reason: str | None = None,
+    before: dict | None = None,
+    after: dict | None = None,
+    request_id: str | None = None,
+) -> None:
+    """在调用方给定的写事务内追加一条业务时间线事件。
+
+    与业务事实同事务写入：每个业务环节的每次结论（生效或被拒绝）恰好一条，
+    全局自增 id 跨环节唯一，按 id 排序即业务发生顺序，重启后不变。
+    """
+    before = before or {}
+    after = after or {}
+    conn.execute(
+        "INSERT INTO timeline_events"
+        "(tenant, order_id, stage, result, amount_cents, paid_after, reconciled_after, "
+        "reject_reason, reason, before_order_id, before_amount_cents, before_currency, "
+        "after_order_id, after_amount_cents, after_currency, request_id) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            tenant, order_id, stage, result, amount_cents, paid_after, reconciled_after,
+            reject_reason, reason,
+            before.get("order_id"), before.get("amount_cents"), before.get("currency"),
+            after.get("order_id"), after.get("amount_cents"), after.get("currency"),
+            request_id,
+        ),
+    )
+
+def insert_conn(
+    conn: sqlite3.Connection,
+    tenant: str,
+    order_id: str,
+    amount_cents: int,
+    currency: str,
+    request_id: str | None = None,
+) -> None:
     """在调用方给定的连接/事务内受理订单。"""
     conn.execute(
         "INSERT INTO orders(tenant, order_id, amount_cents, paid_cents, currency, status) "
         "VALUES(?,?,?,0,?,'accepted')",
         (tenant, order_id, amount_cents, currency),
+    )
+    _insert_timeline_event(
+        conn, tenant, order_id, STAGE_ACCEPTANCE, RESULT_APPLIED,
+        amount_cents=amount_cents, paid_after=0, reconciled_after=0, request_id=request_id,
     )
 
 def get_conn(conn: sqlite3.Connection, tenant: str, order_id: str) -> dict | None:
@@ -72,6 +129,10 @@ def pay_conn(
         "VALUES(?,?,?,?,?)",
         (tenant, order_id, amount_cents, paid_after, request_id),
     )
+    _insert_timeline_event(
+        conn, tenant, order_id, STAGE_PAYMENT, RESULT_APPLIED,
+        amount_cents=amount_cents, paid_after=paid_after, request_id=request_id,
+    )
     updated = get_conn(conn, tenant, order_id)
     assert updated is not None
     return updated
@@ -88,7 +149,8 @@ def reverse_conn(
     - 订单不存在抛 LookupError；
     - 冲正金额 <= 0 或超过当前已收金额抛 ValueError；
     - 冲正会使已收金额低于已核销金额时抛 ValueError。
-    校验失败时不写任何流水、不改变订单金额与状态。成功返回更新后的订单。
+    校验失败时不写冲正流水、不改变订单金额与状态，但拒绝结论会写入业务时间线。
+    成功返回更新后的订单。
     """
     row = conn.execute(
         "SELECT amount_cents, paid_cents, reconciled_cents FROM orders "
@@ -98,13 +160,31 @@ def reverse_conn(
     if row is None:
         raise LookupError("order not found")
     paid_before = row["paid_cents"]
+
+    # 输入与业务校验：拒绝结论写入时间线（不改变任何已有数据与既有留痕），
+    # 与生效结论一样可按订单在时间线中读出。
     if amount_cents <= 0:
-        raise ValueError("reversal amount must be greater than zero")
+        reject = "reversal amount must be greater than zero"
+        _insert_timeline_event(
+            conn, tenant, order_id, STAGE_REVERSAL, RESULT_REJECTED,
+            amount_cents=amount_cents, reject_reason=reject, request_id=request_id,
+        )
+        raise ValueError(reject)
     if amount_cents > paid_before:
-        raise ValueError("reversal amount exceeds paid amount")
+        reject = "reversal amount exceeds paid amount"
+        _insert_timeline_event(
+            conn, tenant, order_id, STAGE_REVERSAL, RESULT_REJECTED,
+            amount_cents=amount_cents, reject_reason=reject, request_id=request_id,
+        )
+        raise ValueError(reject)
     paid_after = paid_before - amount_cents
     if paid_after < row["reconciled_cents"]:
-        raise ValueError("reversal would make paid amount less than reconciled amount")
+        reject = "reversal would make paid amount less than reconciled amount"
+        _insert_timeline_event(
+            conn, tenant, order_id, STAGE_REVERSAL, RESULT_REJECTED,
+            amount_cents=amount_cents, reject_reason=reject, request_id=request_id,
+        )
+        raise ValueError(reject)
 
     conn.execute(
         "UPDATE orders SET paid_cents = ?, "
@@ -117,6 +197,10 @@ def reverse_conn(
         "(tenant, order_id, amount_cents, result, reject_reason, paid_after, request_id) "
         "VALUES(?,?,?,?,NULL,?,?)",
         (tenant, order_id, amount_cents, RESULT_APPLIED, paid_after, request_id),
+    )
+    _insert_timeline_event(
+        conn, tenant, order_id, STAGE_REVERSAL, RESULT_APPLIED,
+        amount_cents=amount_cents, paid_after=paid_after, request_id=request_id,
     )
     updated = get_conn(conn, tenant, order_id)
     assert updated is not None
@@ -133,7 +217,7 @@ def reconcile_conn(
 
     - 订单不存在抛 LookupError；
     - 核销金额 <= 0 或使累计核销超过当前已收金额抛 ValueError。
-    校验失败时不写任何流水、不改变订单金额与状态。
+    校验失败时不写核销流水、不改变订单金额与状态，但拒绝结论会写入业务时间线。
     核销只改变认定口径：已收、未收与订单金额均不变。成功返回更新后的订单。
     """
     row = conn.execute(
@@ -143,11 +227,23 @@ def reconcile_conn(
     ).fetchone()
     if row is None:
         raise LookupError("order not found")
+
+    # 输入与业务校验：拒绝结论写入时间线（不改变任何已有数据与既有留痕）。
     if amount_cents <= 0:
-        raise ValueError("reconciliation amount must be greater than zero")
+        reject = "reconciliation amount must be greater than zero"
+        _insert_timeline_event(
+            conn, tenant, order_id, STAGE_RECONCILIATION, RESULT_REJECTED,
+            amount_cents=amount_cents, reject_reason=reject, request_id=request_id,
+        )
+        raise ValueError(reject)
     reconciled_after = row["reconciled_cents"] + amount_cents
     if reconciled_after > row["paid_cents"]:
-        raise ValueError("reconciled amount would exceed paid amount")
+        reject = "reconciled amount would exceed paid amount"
+        _insert_timeline_event(
+            conn, tenant, order_id, STAGE_RECONCILIATION, RESULT_REJECTED,
+            amount_cents=amount_cents, reject_reason=reject, request_id=request_id,
+        )
+        raise ValueError(reject)
 
     conn.execute(
         "UPDATE orders SET reconciled_cents = ? WHERE tenant=? AND order_id=?",
@@ -158,6 +254,10 @@ def reconcile_conn(
         "(tenant, order_id, amount_cents, result, reconciled_after, request_id) "
         "VALUES(?,?,?,?,?,?)",
         (tenant, order_id, amount_cents, RESULT_APPLIED, reconciled_after, request_id),
+    )
+    _insert_timeline_event(
+        conn, tenant, order_id, STAGE_RECONCILIATION, RESULT_APPLIED,
+        amount_cents=amount_cents, reconciled_after=reconciled_after, request_id=request_id,
     )
     updated = get_conn(conn, tenant, order_id)
     assert updated is not None
@@ -179,6 +279,11 @@ def _insert_refund_record(
         "(tenant, order_id, amount_cents, reason, result, reject_reason, paid_after, request_id) "
         "VALUES(?,?,?,?,?,?,?,?)",
         (tenant, order_id, amount_cents, reason, result, reject_reason, paid_after, request_id),
+    )
+    _insert_timeline_event(
+        conn, tenant, order_id, STAGE_REFUND, result,
+        amount_cents=amount_cents, paid_after=paid_after,
+        reject_reason=reject_reason, reason=reason, request_id=request_id,
     )
 
 
@@ -277,6 +382,10 @@ def _insert_correction_record(
             result, reject_reason, request_id,
         ),
     )
+    _insert_timeline_event(
+        conn, tenant, record_order_id, STAGE_CORRECTION, result,
+        reject_reason=reject_reason, before=before, after=after, request_id=request_id,
+    )
 
 
 def correct_conn(
@@ -354,6 +463,11 @@ def correct_conn(
             "UPDATE correction_records SET order_id=? WHERE tenant=? AND order_id=?",
             (target_id, tenant, order_id),
         )
+        # 时间线事件同样随订单迁移到新标识，保证完整时间线始终可按当前标识读出
+        conn.execute(
+            "UPDATE timeline_events SET order_id=? WHERE tenant=? AND order_id=?",
+            (target_id, tenant, order_id),
+        )
     _insert_correction_record(
         conn, tenant, target_id, before, after, RESULT_APPLIED, None, request_id
     )
@@ -397,6 +511,27 @@ def list_refunds_conn(conn: sqlite3.Connection, tenant: str, order_id: str) -> l
     rows = conn.execute(
         "SELECT id, amount_cents, reason, result, reject_reason, paid_after, request_id, created_at "
         "FROM refund_records WHERE tenant=? AND order_id=? ORDER BY id",
+        (tenant, order_id),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+_TIMELINE_COLUMNS = (
+    "id, stage, result, amount_cents, paid_after, reconciled_after, reject_reason, reason, "
+    "before_order_id, before_amount_cents, before_currency, "
+    "after_order_id, after_amount_cents, after_currency, request_id, created_at"
+)
+
+def list_timeline_conn(conn: sqlite3.Connection, tenant: str, order_id: str) -> list[dict]:
+    """按业务发生顺序读出订单的全部时间线事件（各环节合并）；订单不存在抛 LookupError。
+
+    排序依据全局自增 id：与事件写入的先后（即业务发生顺序）严格一致，
+    重复读取、并发读取与重启后顺序与内容均不变。
+    """
+    if get_conn(conn, tenant, order_id) is None:
+        raise LookupError("order not found")
+    rows = conn.execute(
+        f"SELECT {_TIMELINE_COLUMNS} FROM timeline_events "
+        "WHERE tenant=? AND order_id=? ORDER BY id",
         (tenant, order_id),
     ).fetchall()
     return [dict(row) for row in rows]
@@ -453,6 +588,10 @@ def reverse_payment(tenant: str, order_id: str, amount_cents: int) -> dict | Non
         except LookupError:
             conn.execute("ROLLBACK")
             return None
+        except ValueError:
+            # 业务拒绝结论已写入时间线，需提交保留（订单本身与既有留痕不变）
+            conn.execute("COMMIT")
+            raise
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -503,6 +642,16 @@ def list_reversals(tenant: str, order_id: str) -> list[dict] | None:
     finally:
         conn.close()
 
+def list_timeline(tenant: str, order_id: str) -> list[dict] | None:
+    conn = connect()
+    try:
+        try:
+            return list_timeline_conn(conn, tenant, order_id)
+        except LookupError:
+            return None
+    finally:
+        conn.close()
+
 def reconcile(tenant: str, order_id: str, amount_cents: int) -> dict | None:
     """无请求标识的核销入口：订单不存在返回 None，金额非法抛 ValueError。"""
     conn = connect()
@@ -513,6 +662,10 @@ def reconcile(tenant: str, order_id: str, amount_cents: int) -> dict | None:
         except LookupError:
             conn.execute("ROLLBACK")
             return None
+        except ValueError:
+            # 业务拒绝结论已写入时间线，需提交保留（订单本身与既有留痕不变）
+            conn.execute("COMMIT")
+            raise
         except Exception:
             conn.execute("ROLLBACK")
             raise

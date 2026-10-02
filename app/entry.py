@@ -285,6 +285,17 @@ def read_refunds(order_id: str, x_tenant: str = Header(default="")) -> dict:
         raise HTTPException(status_code=404, detail="order not found")
     return {"order_id": order_id, "refunds": records}
 
+@app.get("/orders/{order_id}/timeline")
+def read_timeline(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = x_tenant or ""
+    if not tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    records = orders.list_timeline(tenant, order_id)
+    if records is None:
+        # 跨租户同样按不存在处理，不泄漏订单是否存在
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"order_id": order_id, "timeline": records}
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)

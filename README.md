@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、批量导入订单（逗号分隔文本按行受理）、登记收款并核对未收金额、对已登记收款进行冲正、对收款进行对账核销、对已受理但尚未发生任何业务的订单进行更正（修改金额/币种/订单标识）、对已登记收款的订单按笔主动退款（真实出账退钱）；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、批量导入订单（逗号分隔文本按行受理）、登记收款并核对未收金额、对已登记收款进行冲正、对收款进行对账核销、对已受理但尚未发生任何业务的订单进行更正（修改金额/币种/订单标识）、对已登记收款的订单按笔主动退款（真实出账退钱），并可按订单一次读出从受理至今全部业务事实合并后的业务时间线；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 受理订单、登记收款、收款冲正、核销、订单更正与退款支持基于请求标识（`Idempotency-Key` 请求头）的幂等：网络重试、重复点击、并发重复提交都不会造成重复受理、重复收款、重复冲正、重复核销、重复更正或重复退款。
 
@@ -11,7 +11,7 @@
 
 ## 启动
 
-- 启动时会自动执行 `migrations/` 下的建表迁移（按版本记录，只执行一次；含幂等记录表与收款/冲正/核销/更正/退款留痕表）：
+- 启动时会自动执行 `migrations/` 下的建表迁移（按版本记录，只执行一次；含幂等记录表、收款/冲正/核销/更正/退款留痕表与业务时间线事件表）：
   `python3 -m app.entry --port 8000`
 - 只做迁移不启动：`python3 -m app.entry --migrate`
 - 健康检查：`GET /health`
@@ -181,6 +181,18 @@ curl -i -X POST http://127.0.0.1:8000/orders/ord-1/refunds \
 
 # 28) 按订单读出每笔退款留痕（含被拒绝结论：金额、结果、拒绝原因、退款原因、退款后已收等）
 curl -s http://127.0.0.1:8000/orders/ord-1/refunds -H 'X-Tenant: tenant-a'
+
+# 29) 业务时间线：一次调用读出该订单从受理至今的全部业务事实（各环节合并、按发生顺序排列）
+curl -s http://127.0.0.1:8000/orders/ord-1/timeline -H 'X-Tenant: tenant-a'
+# => {"order_id":"ord-1","timeline":[
+#      {"id":1,"stage":"acceptance","result":"applied","amount_cents":500,"paid_after":0,"reconciled_after":0,...},
+#      {"id":2,"stage":"payment","result":"applied","amount_cents":200,"paid_after":200,...},
+#      {"id":3,"stage":"reversal","result":"applied","amount_cents":150,"paid_after":50,...},
+#      {"id":4,"stage":"payment","result":"applied","amount_cents":450,"paid_after":500,...},
+#      {"id":5,"stage":"reconciliation","result":"applied","amount_cents":300,"reconciled_after":300,...},
+#      {"id":6,"stage":"refund","result":"applied","amount_cents":100,"reason":"customer return","paid_after":400,...}]}
+#    被拒绝的冲正/核销/更正/退款结论同样各占一条（result=rejected 并注明 reject_reason）；
+#    幂等回放不新增条目；跨租户读取或订单不存在返回 404
 ```
 
 重启服务后再次提交上述相同请求，结论与重启前一致：重复请求仍回放首次结果，冲突请求仍被拒绝；已生效的冲正、核销、更正、退款及其留痕继续保留。
@@ -236,6 +248,11 @@ curl -s http://127.0.0.1:8000/orders/ord-1/refunds -H 'X-Tenant: tenant-a'
   - 携带 `Idempotency-Key` 时：同租户同标识的重复退款回放首次结果（含首次的 200/409/404 结论），不重复退款；标识相同但退款金额、退款原因、目标订单或操作类型不同返回 422 且不改变任何数据。
   - 不携带 `Idempotency-Key` 时按普通单次操作处理（规则相同，仅不做请求标识去重与回放）。
 - `GET /orders/{order_id}/refunds`：按发生顺序读出该订单的每笔退款留痕（含被拒绝结论），字段含 `amount_cents`、`reason`、`result`（applied/rejected）、`reject_reason`、`paid_after`、`request_id`、`created_at`；不存在或跨租户返回 404。
+- `GET /orders/{order_id}/timeline`：业务时间线。一次调用读出该订单从受理至今的全部业务事实，受理、收款、冲正、核销、更正、退款各环节合并后按业务发生顺序排列；不存在或跨租户返回 404（不泄漏对象是否存在）。
+  - 每条事件字段：`id`（全局自增，跨环节唯一，排序依据）、`stage`（acceptance/payment/reversal/reconciliation/correction/refund）、`result`（applied/rejected）、`amount_cents`、`paid_after`（该结论生效后的累计已收，受理为 0）、`reconciled_after`（核销后的累计已核销，受理为 0）、`reject_reason`、`reason`（退款原因）、更正前后内容（`before_order_id`/`before_amount_cents`/`before_currency` 与 `after_order_id`/`after_amount_cents`/`after_currency`）、`request_id`、`created_at`；不适用的字段为 null。
+  - 同一次业务请求至多产生一条事件：带请求标识的重复提交回放首次结果，不新增事件；被拒绝的冲正、核销、退款与更正结论同样各占一条并注明拒绝原因（被拒绝的冲正/核销只写入时间线，不进入各自留痕表，既有读取入口不变）。
+  - 排序可判定且可重放：事件与业务事实在同一写事务内追加，按 `id` 排序即业务发生顺序（含批量导入的订单与其后第一笔收款的先后关系）；重复读取、并发读取与服务重启均不改变顺序与内容。
+  - 订单更正改名时，该订单的既有时间线事件随订单迁移到新标识，完整时间线始终可按当前标识读出（旧标识按不存在处理）。
 - `GET /health`：返回服务与数据库状态。
 
 幂等作用域为「租户 + 请求标识」：不同租户使用相同请求标识互不影响；幂等记录持久化在数据库中，服务重启后继续有效。

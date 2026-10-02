@@ -56,7 +56,7 @@ def accept_order(tenant: str, request_id: str, order_id: str, amount_cents: int,
 
         try:
             try:
-                orders.insert_conn(conn, tenant, order_id, amount_cents, currency)
+                orders.insert_conn(conn, tenant, order_id, amount_cents, currency, request_id)
                 status_code, body = 201, orders.get_conn(conn, tenant, order_id)
             except sqlite3.IntegrityError:
                 # 同一租户重复受理（未携带本请求标识的既有订单/或首次结果即冲突）
