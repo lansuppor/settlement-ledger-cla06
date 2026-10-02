@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、批量导入订单（逗号分隔文本按行受理）、登记收款并核对未收金额、对已登记收款进行冲正、对收款进行对账核销、对已受理但尚未发生任何业务的订单进行更正（修改金额/币种/订单标识）、对已登记收款的订单按笔主动退款（真实出账退钱），以及按订单一次读出从受理至今全部业务事实合并后的业务时间线；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、按条件检索订单（状态/币种/金额区间筛选、按受理顺序游标分页）、批量导入订单（逗号分隔文本按行受理）、登记收款并核对未收金额、对已登记收款进行冲正、对收款进行对账核销、对已受理但尚未发生任何业务的订单进行更正（修改金额/币种/订单标识）、对已登记收款的订单按笔主动退款（真实出账退钱），以及按订单一次读出从受理至今全部业务事实合并后的业务时间线；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 受理订单、登记收款、收款冲正、核销、订单更正与退款支持基于请求标识（`Idempotency-Key` 请求头）的幂等：网络重试、重复点击、并发重复提交都不会造成重复受理、重复收款、重复冲正、重复核销、重复更正或重复退款。
 
@@ -191,6 +191,19 @@ curl -s http://127.0.0.1:8000/orders/ord-1/timeline -H 'X-Tenant: tenant-a'
 #      ...]}
 #    每条注明环节、生效/拒绝结论、金额与结果相关字段、请求标识与发生时间；
 #    重复提交（幂等回放）不新增条目；跨租户或订单不存在返回 404
+
+# 30) 条件检索：按状态/币种/金额区间筛选本租户订单，按受理顺序游标分页
+curl -s 'http://127.0.0.1:8000/orders?status=accepted&currency=CNY&min_amount_cents=100&max_amount_cents=1000&limit=2' \
+  -H 'X-Tenant: tenant-a'
+# => {"orders":[{"order_id":"ord-1","amount_cents":500,"paid_cents":400,"outstanding_cents":100,
+#      "reconciled_cents":300,"currency":"CNY","status":"accepted","tenant":"tenant-a"}, ...],
+#     "next_cursor":"eyJ2IjoxLCJzIjoyfQ"}
+#    翻页：把上一步响应的 next_cursor 原样作为 cursor 继续查询，直到 next_cursor 为空
+curl -s 'http://127.0.0.1:8000/orders?status=accepted&currency=CNY&limit=2&cursor=eyJ2IjoxLCJzIjoyfQ' \
+  -H 'X-Tenant: tenant-a'
+#    状态可同时包含两者：?status=accepted&status=settled（或 status=accepted,settled）；
+#    limit 缺省 50，超出 1~200 或条件非法返回 400；翻页期间并发受理/收款/冲正/核销/更正/退款
+#    不影响已翻过的页与游标位置，同一条件同一游标重复查询结果完全一致
 ```
 
 重启服务后再次提交上述相同请求，结论与重启前一致：重复请求仍回放首次结果，冲突请求仍被拒绝；已生效的冲正、核销、更正、退款及其留痕继续保留。
@@ -212,6 +225,13 @@ curl -s http://127.0.0.1:8000/orders/ord-1/timeline -H 'X-Tenant: tenant-a'
   - 重复导入安全：同租户同订单标识且金额与币种完全一致的行按「跳过」处理；金额或币种与已有订单不一致的行按「失败」处理；二者均不改变已有数据。
   - 始终返回 200 与计数闭合的结果：`submitted = succeeded + skipped + failed`；`failures` 逐行给出 `line`、`order_id`（能解析出时）、`reason` 与 `detail`，`reason` 可区分：`invalid_fields`（字段缺失或格式错误）、`invalid_amount`（金额不是正整数）、`unsupported_currency`（币种不受支持）、`order_conflict`（订单标识与已有订单的业务内容不一致）；`skips` 逐行给出跳过明细，`reason` 为 `order_exists`（订单标识已存在，同租户重复受理）。
 - `GET /orders/{order_id}`：按标识读取订单。租户通过请求头 `X-Tenant` 传入；不存在返回 404；跨租户读取返回 404（不泄漏对象是否存在）。
+- `GET /orders`：条件检索本租户订单（只读，不改变任何订单金额、状态与留痕）。租户通过请求头 `X-Tenant` 传入，缺少租户返回 400。
+  - 查询条件均可选，不给出视为不限制：`status`（`accepted` 未收清 / `settled` 已结清，可重复传参或逗号分隔同时包含两者）、`currency`（限服务支持币种）、`min_amount_cents` / `max_amount_cents`（订单金额上下限，最小货币单位非负整数，下限不得大于上限）。
+  - `limit` 为一次返回的条数：1~200，缺省按 50 返回，超出范围或不是整数返回 400；状态值、币种、金额区间或游标非法同样返回 400。
+  - 响应为 `{"orders": [...], "next_cursor": "..."}`：每条返回项与按标识读取订单的字段一致（`tenant`、`order_id`、`amount_cents`、`paid_cents`、`outstanding_cents`、`reconciled_cents`、`currency`、`status`）；命中为空时返回空列表而不是错误。
+  - 排序按受理顺序稳定排列：以业务时间线中受理条目的全库单调序号为准（批量导入的多张订单按导入行先后排列），同一订单只出现一次。
+  - 分页为键集分页：返回条数不足 `limit` 即为最后一页、`next_cursor` 为空；否则把 `next_cursor` 原样作为下一次请求的 `cursor` 继续取下一页。游标位置只由受理顺序序号表达，不含租户、订单标识或任何数据库内部位置；翻页期间同租户并发受理、收款、冲正、核销、更正与退款不会使已翻过的页重复、未翻到的页漏单，同一条件同一游标的多次查询返回完全相同的订单集合与顺序，服务重启后结论不变。
+  - 隔离照常成立：结果只包含 `X-Tenant` 指定租户自己的订单，其他租户的条件与游标都不会造成越界读取。
 - `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`。
   - 携带 `Idempotency-Key` 时：同租户同标识的重复提交回放首次结果（含首次的 200/409/404 结论），收款金额不重复累加；标识相同但收款金额或目标订单不同返回 422 且不登记收款。
   - 不携带 `Idempotency-Key` 时：超过未收金额返回 409、订单不存在返回 404（原有行为不变）。

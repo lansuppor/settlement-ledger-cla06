@@ -3,7 +3,8 @@ import sqlite3
 from app.rules import order_rules
 from app.store.db import connect
 
-ORDER_COLUMNS = "tenant, order_id, amount_cents, paid_cents, reconciled_cents, currency, status"
+ORDER_COLUMN_NAMES = ("tenant", "order_id", "amount_cents", "paid_cents", "reconciled_cents", "currency", "status")
+ORDER_COLUMNS = ", ".join(ORDER_COLUMN_NAMES)
 
 RESULT_APPLIED = "applied"
 RESULT_REJECTED = "rejected"
@@ -40,7 +41,9 @@ class ReconciliationRejected(ValueError):
 _FACT_TABLES = ("payment_records", "reversal_records", "reconciliation_records", "refund_records")
 
 def _row_to_order(row: sqlite3.Row) -> dict:
-    return {**dict(row), "outstanding_cents": row["amount_cents"] - row["paid_cents"]}
+    data = {key: row[key] for key in ORDER_COLUMN_NAMES}
+    data["outstanding_cents"] = row["amount_cents"] - row["paid_cents"]
+    return data
 
 def _insert_timeline_event(
     conn: sqlite3.Connection,
@@ -551,6 +554,54 @@ def list_reversals_conn(conn: sqlite3.Connection, tenant: str, order_id: str) ->
     ).fetchall()
     return [dict(row) for row in rows]
 
+def search_conn(
+    conn: sqlite3.Connection,
+    tenant: str,
+    statuses: list[str],
+    currency: str | None,
+    min_amount_cents: int | None,
+    max_amount_cents: int | None,
+    limit: int,
+    after_seq: int | None,
+) -> tuple[list[dict], int | None]:
+    """按受理顺序检索本租户命中条件的订单（键集分页），不携带请求标识、不写任何数据。
+
+    排序键为业务时间线中受理条目的全库单调序号（timeline_events.id，每张订单恰有一条
+    受理条目；批量导入按行先后受理，序号同样按行递增）：受理后即不再变化，翻页期间的
+    新受理、收款、冲正、核销、更正与退款都不会改变已翻过页的位置，故不重不漏、可重放。
+    游标位置只由该序号表达（after_seq=上一页最后一条的受理序号），不含租户、订单标识
+    或任何数据库内部位置。返回 (本页订单, 本页最后一条的受理序号)；订单字段与按标识
+    读取一致，同一订单只出现一次。
+    """
+    clauses = ["o.tenant = ?"]
+    params: list = [tenant]
+    if statuses:
+        clauses.append("o.status IN (" + ",".join("?" for _ in statuses) + ")")
+        params.extend(statuses)
+    if currency is not None:
+        clauses.append("o.currency = ?")
+        params.append(currency)
+    if min_amount_cents is not None:
+        clauses.append("o.amount_cents >= ?")
+        params.append(min_amount_cents)
+    if max_amount_cents is not None:
+        clauses.append("o.amount_cents <= ?")
+        params.append(max_amount_cents)
+    if after_seq is not None:
+        clauses.append("t.id > ?")
+        params.append(after_seq)
+    prefixed = ", ".join(f"o.{name}" for name in ORDER_COLUMN_NAMES)
+    rows = conn.execute(
+        f"SELECT {prefixed}, t.id AS accept_seq FROM orders o "
+        "JOIN timeline_events t ON t.tenant = o.tenant AND t.order_id = o.order_id "
+        "AND t.stage = 'acceptance' "
+        f"WHERE {' AND '.join(clauses)} ORDER BY t.id LIMIT ?",
+        (*params, limit),
+    ).fetchall()
+    page = [_row_to_order(row) for row in rows]
+    last_seq = rows[-1]["accept_seq"] if rows else None
+    return page, last_seq
+
 def insert(tenant: str, order_id: str, amount_cents: int, currency: str) -> None:
     conn = connect()
     try:
@@ -562,6 +613,24 @@ def get(tenant: str, order_id: str) -> dict | None:
     conn = connect()
     try:
         return get_conn(conn, tenant, order_id)
+    finally:
+        conn.close()
+
+def search(
+    tenant: str,
+    statuses: list[str],
+    currency: str | None,
+    min_amount_cents: int | None,
+    max_amount_cents: int | None,
+    limit: int,
+    after_seq: int | None,
+) -> tuple[list[dict], int | None]:
+    """条件检索入口：只读，不改变任何订单金额、状态与留痕。"""
+    conn = connect()
+    try:
+        return search_conn(
+            conn, tenant, statuses, currency, min_amount_cents, max_amount_cents, limit, after_seq
+        )
     finally:
         conn.close()
 
