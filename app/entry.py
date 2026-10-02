@@ -1,11 +1,12 @@
 import argparse
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
 from app.store import orders
 from app.store.db import connect, migrate
+from app.usecase import batch as batch_uc
 from app.usecase import orders as orders_uc
 
 app = FastAPI(title="settlement-ledger")
@@ -65,6 +66,11 @@ def create_order(body: OrderIn, idempotency_key: str = Header(default="", alias=
     if result.status_code != 201:
         raise HTTPException(status_code=result.status_code, detail=result.body.get("detail"))
     return result.body
+
+@app.post("/orders/import")
+def import_orders(body: str = Body(default="", media_type="text/plain")) -> dict:
+    # 逗号分隔文本按行受理：部分成功、逐行结论、可安全重试；不携带请求标识
+    return batch_uc.import_orders(body)
 
 @app.get("/orders/{order_id}")
 def read_order(order_id: str, x_tenant: str = Header(default="")) -> dict:
