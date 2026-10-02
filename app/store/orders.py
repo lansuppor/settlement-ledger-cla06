@@ -13,8 +13,13 @@ RESULT_REJECTED = "rejected"
 class CorrectionRejected(ValueError):
     pass
 
+# 退款被业务规则拒绝（金额非正整数、退款后已收为负或低于已核销）：
+# 拒绝结论已写入退款留痕，调用方据此返回 409。
+class RefundRejected(ValueError):
+    pass
+
 # 更正前置校验所查看的留痕表：任一表存在该订单的记录即视为已产生业务事实
-_FACT_TABLES = ("payment_records", "reversal_records", "reconciliation_records")
+_FACT_TABLES = ("payment_records", "reversal_records", "reconciliation_records", "refund_records")
 
 def _row_to_order(row: sqlite3.Row) -> dict:
     return {**dict(row), "outstanding_cents": row["amount_cents"] - row["paid_cents"]}
@@ -153,6 +158,86 @@ def reconcile_conn(
         "(tenant, order_id, amount_cents, result, reconciled_after, request_id) "
         "VALUES(?,?,?,?,?,?)",
         (tenant, order_id, amount_cents, RESULT_APPLIED, reconciled_after, request_id),
+    )
+    updated = get_conn(conn, tenant, order_id)
+    assert updated is not None
+    return updated
+
+def _insert_refund_record(
+    conn: sqlite3.Connection,
+    tenant: str,
+    order_id: str,
+    amount_cents: int,
+    reason: str,
+    result: str,
+    reject_reason: str | None,
+    paid_after: int | None,
+    request_id: str | None,
+) -> None:
+    conn.execute(
+        "INSERT INTO refund_records"
+        "(tenant, order_id, amount_cents, reason, result, reject_reason, paid_after, request_id) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (tenant, order_id, amount_cents, reason, result, reject_reason, paid_after, request_id),
+    )
+
+
+def refund_conn(
+    conn: sqlite3.Connection,
+    tenant: str,
+    order_id: str,
+    amount_cents: int,
+    reason: str,
+    request_id: str | None = None,
+) -> dict:
+    """在调用方给定的写事务内对已登记收款的订单按笔退款，并写入退款流水。
+
+    退款是真实出账退钱（区别于纠正录错登记的冲正）：已收减少、未收相应增加，
+    仍有未收金额时状态回到 accepted，之后可继续收款直至重新 settled。
+
+    - 订单不存在抛 LookupError（不写任何留痕，跨租户同样按不存在处理）；
+    - 金额非正整数、退款后已收为负、退款后已收低于已核销金额时抛 RefundRejected，
+      并把该结论（含退款原因与具体拒绝原因）写入退款留痕，订单本身保持不变。
+    成功返回更新后的订单。
+    """
+    row = conn.execute(
+        "SELECT amount_cents, paid_cents, reconciled_cents FROM orders "
+        "WHERE tenant=? AND order_id=?",
+        (tenant, order_id),
+    ).fetchone()
+    if row is None:
+        raise LookupError("order not found")
+    paid_before = row["paid_cents"]
+
+    # 输入与业务校验：拒绝结论同样留痕（不改变任何已有数据），与生效结论一样可按订单读出。
+    if amount_cents <= 0:
+        reject = "refund amount must be a positive integer in minor units"
+        _insert_refund_record(
+            conn, tenant, order_id, amount_cents, reason, RESULT_REJECTED, reject, None, request_id
+        )
+        raise RefundRejected(reject)
+    paid_after = paid_before - amount_cents
+    if paid_after < 0:
+        reject = "refund would make paid amount negative"
+        _insert_refund_record(
+            conn, tenant, order_id, amount_cents, reason, RESULT_REJECTED, reject, None, request_id
+        )
+        raise RefundRejected(reject)
+    if paid_after < row["reconciled_cents"]:
+        reject = "refund would make paid amount less than reconciled amount"
+        _insert_refund_record(
+            conn, tenant, order_id, amount_cents, reason, RESULT_REJECTED, reject, None, request_id
+        )
+        raise RefundRejected(reject)
+
+    conn.execute(
+        "UPDATE orders SET paid_cents = ?, "
+        "status = CASE WHEN ? >= amount_cents THEN 'settled' ELSE 'accepted' END "
+        "WHERE tenant=? AND order_id=?",
+        (paid_after, paid_after, tenant, order_id),
+    )
+    _insert_refund_record(
+        conn, tenant, order_id, amount_cents, reason, RESULT_APPLIED, None, paid_after, request_id
     )
     updated = get_conn(conn, tenant, order_id)
     assert updated is not None
@@ -305,6 +390,17 @@ def list_reconciliations_conn(conn: sqlite3.Connection, tenant: str, order_id: s
     ).fetchall()
     return [dict(row) for row in rows]
 
+def list_refunds_conn(conn: sqlite3.Connection, tenant: str, order_id: str) -> list[dict]:
+    """按发生顺序读出订单的每笔退款留痕（含被拒绝结论）；订单不存在抛 LookupError。"""
+    if get_conn(conn, tenant, order_id) is None:
+        raise LookupError("order not found")
+    rows = conn.execute(
+        "SELECT id, amount_cents, reason, result, reject_reason, paid_after, request_id, created_at "
+        "FROM refund_records WHERE tenant=? AND order_id=? ORDER BY id",
+        (tenant, order_id),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
 def list_reversals_conn(conn: sqlite3.Connection, tenant: str, order_id: str) -> list[dict]:
     """按发生顺序读出订单的每笔冲正留痕；订单不存在抛 LookupError。"""
     if get_conn(conn, tenant, order_id) is None:
@@ -364,6 +460,38 @@ def reverse_payment(tenant: str, order_id: str, amount_cents: int) -> dict | Non
     finally:
         conn.close()
     return order
+
+def refund(tenant: str, order_id: str, amount_cents: int, reason: str) -> dict | None:
+    """无请求标识的退款入口：订单不存在返回 None，非法退款抛 RefundRejected。"""
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            order = refund_conn(conn, tenant, order_id, amount_cents, reason)
+        except LookupError:
+            conn.execute("ROLLBACK")
+            return None
+        except RefundRejected:
+            # 业务拒绝结论已写入退款留痕，需提交保留（订单本身保持不变）
+            conn.execute("COMMIT")
+            raise
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    return order
+
+def list_refunds(tenant: str, order_id: str) -> list[dict] | None:
+    conn = connect()
+    try:
+        try:
+            return list_refunds_conn(conn, tenant, order_id)
+        except LookupError:
+            return None
+    finally:
+        conn.close()
 
 def list_reversals(tenant: str, order_id: str) -> list[dict] | None:
     conn = connect()

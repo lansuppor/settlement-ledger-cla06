@@ -38,6 +38,12 @@ class CorrectionIn(BaseModel):
     amount_cents: int
     currency: str
 
+class RefundIn(BaseModel):
+    # 不使用 gt=0：金额 <= 0 属于业务非法，需与「退款后已收为负/低于已核销」一起
+    # 由业务层返回 409 及明确原因，与订单不存在(404)、幂等冲突(422) 区分开。
+    amount_cents: int
+    reason: str
+
 @app.get("/health")
 def health() -> dict:
     conn = connect()
@@ -237,6 +243,47 @@ def read_corrections(order_id: str, x_tenant: str = Header(default="")) -> dict:
         # 跨租户同样按不存在处理，不泄漏订单是否存在
         raise HTTPException(status_code=404, detail="order not found")
     return {"order_id": order_id, "corrections": records}
+
+@app.post("/orders/{order_id}/refunds")
+def add_refund(
+    order_id: str,
+    body: RefundIn,
+    x_tenant: str = Header(default=""),
+    idempotency_key: str = Header(default="", alias=IDEMPOTENCY_HEADER),
+) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+
+    if not idempotency_key:
+        # 未携带请求标识：与收款、冲正、核销一致的处理方式
+        try:
+            order = orders.refund(x_tenant, order_id, body.amount_cents, body.reason)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error))
+        if order is None:
+            raise HTTPException(status_code=404, detail="order not found")
+        return order
+
+    try:
+        result = orders_uc.refund_order(
+            x_tenant, idempotency_key, order_id, body.amount_cents, body.reason
+        )
+    except orders_uc.IdempotentConflict as error:
+        raise HTTPException(status_code=422, detail=str(error))
+    if result.status_code != 200:
+        raise HTTPException(status_code=result.status_code, detail=result.body.get("detail"))
+    return result.body
+
+@app.get("/orders/{order_id}/refunds")
+def read_refunds(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = x_tenant or ""
+    if not tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    records = orders.list_refunds(tenant, order_id)
+    if records is None:
+        # 跨租户同样按不存在处理，不泄漏订单是否存在
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"order_id": order_id, "refunds": records}
 
 def main() -> None:
     parser = argparse.ArgumentParser()

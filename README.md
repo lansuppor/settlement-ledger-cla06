@@ -1,8 +1,8 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、批量导入订单（逗号分隔文本按行受理）、登记收款并核对未收金额、对已登记收款进行冲正、对收款进行对账核销、对已受理但尚未发生任何业务的订单进行更正（修改金额/币种/订单标识）；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、批量导入订单（逗号分隔文本按行受理）、登记收款并核对未收金额、对已登记收款进行冲正、对收款进行对账核销、对已受理但尚未发生任何业务的订单进行更正（修改金额/币种/订单标识）、对已登记收款的订单按笔主动退款（真实出账退钱）；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
-受理订单、登记收款、收款冲正、核销与订单更正支持基于请求标识（`Idempotency-Key` 请求头）的幂等：网络重试、重复点击、并发重复提交都不会造成重复受理、重复收款、重复冲正、重复核销或重复更正。
+受理订单、登记收款、收款冲正、核销、订单更正与退款支持基于请求标识（`Idempotency-Key` 请求头）的幂等：网络重试、重复点击、并发重复提交都不会造成重复受理、重复收款、重复冲正、重复核销、重复更正或重复退款。
 
 ## 环境与安装
 
@@ -11,7 +11,7 @@
 
 ## 启动
 
-- 启动时会自动执行 `migrations/` 下的建表迁移（按版本记录，只执行一次；含幂等记录表与收款/冲正/核销/更正留痕表）：
+- 启动时会自动执行 `migrations/` 下的建表迁移（按版本记录，只执行一次；含幂等记录表与收款/冲正/核销/更正/退款留痕表）：
   `python3 -m app.entry --port 8000`
 - 只做迁移不启动：`python3 -m app.entry --migrate`
 - 健康检查：`GET /health`
@@ -159,9 +159,31 @@ curl -i -X POST http://127.0.0.1:8000/orders/ord-fixed/correction \
 
 # 24) 按订单读出每笔更正留痕（含生效与拒绝结论、更正前后内容，按发生顺序）
 curl -s http://127.0.0.1:8000/orders/ord-fixed/corrections -H 'X-Tenant: tenant-a'
+
+# 25) 主动退款：把已收金额退回付款方（真实出账，与纠正录错登记的冲正不同）
+curl -s -X POST http://127.0.0.1:8000/orders/ord-1/refunds \
+  -H 'Content-Type: application/json' -H 'X-Tenant: tenant-a' \
+  -H 'Idempotency-Key: ref-1001' \
+  -d '{"amount_cents":100,"reason":"customer return"}'
+# => paid_cents=400, outstanding_cents=100, status=accepted；订单金额与已核销不变
+
+# 26) 同标识重复退款 —— 回放首次结果，不重复退款；换金额/退款原因/订单/操作类型则 422
+curl -s -X POST http://127.0.0.1:8000/orders/ord-1/refunds \
+  -H 'Content-Type: application/json' -H 'X-Tenant: tenant-a' \
+  -H 'Idempotency-Key: ref-1001' \
+  -d '{"amount_cents":100,"reason":"customer return"}'
+
+# 27) 非法退款 —— 409 且原因可区分：金额非正整数 / 退款后已收为负 / 退款后已收低于已核销
+curl -i -X POST http://127.0.0.1:8000/orders/ord-1/refunds \
+  -H 'Content-Type: application/json' -H 'X-Tenant: tenant-a' \
+  -d '{"amount_cents":9999,"reason":"customer return"}'
+#   订单不存在（含跨租户）为 404；幂等标识被用于不同请求内容为 422
+
+# 28) 按订单读出每笔退款留痕（含被拒绝结论：金额、结果、拒绝原因、退款原因、退款后已收等）
+curl -s http://127.0.0.1:8000/orders/ord-1/refunds -H 'X-Tenant: tenant-a'
 ```
 
-重启服务后再次提交上述相同请求，结论与重启前一致：重复请求仍回放首次结果，冲突请求仍被拒绝；已生效的冲正、核销、更正及其留痕继续保留。
+重启服务后再次提交上述相同请求，结论与重启前一致：重复请求仍回放首次结果，冲突请求仍被拒绝；已生效的冲正、核销、更正、退款及其留痕继续保留。
 
 ## 测试
 
@@ -199,13 +221,21 @@ curl -s http://127.0.0.1:8000/orders/ord-fixed/corrections -H 'X-Tenant: tenant-
   - 携带 `Idempotency-Key` 时：同租户同标识的重复核销回放首次结果（含首次的 200/409/404 结论），不重复累加核销金额；标识相同但核销金额、目标订单或操作类型不同返回 422 且不改变任何数据。
 - `GET /orders/{order_id}/reconciliations`：按发生顺序读出该订单的每笔核销留痕，字段含 `amount_cents`、`result`、`reconciled_after`、`request_id`、`created_at`；不存在或跨租户返回 404。
 - `POST /orders/{order_id}/correction`：更正已受理订单。请求字段 `order_id`（更正后的订单标识）、`amount_cents`、`currency`；成功返回 200 与更正后的订单对象，订单按新标识可读（旧标识不再存在）。
-  - 仅当订单 `paid_cents`、`reconciled_cents` 均为 0 且没有任何收款、冲正、核销留痕时才允许更正（冲正后已收回到 0 但仍有留痕的订单不可更正）；存在任一业务事实时返回 409，订单金额、币种、标识、状态与全部留痕保持不变。
+  - 仅当订单 `paid_cents`、`reconciled_cents` 均为 0 且没有任何收款、冲正、核销、退款留痕时才允许更正（冲正或退款后已收回到 0 但仍有留痕的订单不可更正）；存在任一业务事实时返回 409，订单金额、币种、标识、状态与全部留痕保持不变。
   - 非法或冲突内容返回 409，`detail` 区分具体原因：`amount must be a positive integer in minor units`（金额 ≤ 0）、`unsupported currency: <币种>`（币种不受支持）、`order id must not be empty`（新标识为空）、`target order id already exists for tenant`（同租户新标识已被其他订单占用；跨租户同名不冲突）、`order has payments, reversals or reconciliations and cannot be corrected`（订单已有业务事实）；拒绝不改变订单本身。
   - 订单不存在或跨租户访问返回 404（跨租户不泄漏订单是否存在）。
   - 生效与拒绝结论都写更正留痕（拒绝留痕挂在原订单标识，生效留痕挂在更正后标识，改名时历史留痕随订单迁移）。
   - 携带 `Idempotency-Key` 时：同租户同标识的重复更正回放首次结果（含首次的 200/409/404 结论），不重复更正；标识相同但目标订单、更正后订单标识/金额/币种不同，或被用于受理/收款/冲正/核销等不同操作类型时返回 422 且不改变任何数据。
   - 不携带 `Idempotency-Key` 时按普通单次操作处理（规则相同，仅不做请求标识去重与回放）。
 - `GET /orders/{order_id}/corrections`：按发生顺序读出该订单的每笔更正留痕，字段含更正前后的 `before_order_id`/`before_amount_cents`/`before_currency` 与 `after_order_id`/`after_amount_cents`/`after_currency`、`result`（applied/rejected）、`reject_reason`、`request_id`、`created_at`；不存在或跨租户返回 404。
+- `POST /orders/{order_id}/refunds`：对已登记收款的订单按笔主动退款（真实出账退钱，区别于纠正录错登记的冲正）。请求字段 `amount_cents`、`reason`（退款原因）。
+  - 退款使订单 `paid_cents` 减少、`outstanding_cents` 相应增加（二者之和始终等于订单金额），订单金额与 `reconciled_cents` 不变；仍有未收金额时状态回到 `accepted`，之后可继续收款，收清后重新进入 `settled`。
+  - 成功返回 200 与更新后的订单对象；同时写一条 `result=applied` 的退款留痕。
+  - 非法退款返回 409，`detail` 区分具体原因：`refund amount must be a positive integer in minor units`（金额非正整数）、`refund would make paid amount negative`（退款后已收为负，即累计退款超过累计已收减去累计已退）、`refund would make paid amount less than reconciled amount`（退款后已收低于已核销金额）；被拒绝的结论同样写入退款留痕（`result=rejected`），订单金额、已收、未收、已核销、状态与其余留痕均不变。
+  - 订单不存在或跨租户访问返回 404（跨租户不泄漏订单是否存在）。
+  - 携带 `Idempotency-Key` 时：同租户同标识的重复退款回放首次结果（含首次的 200/409/404 结论），不重复退款；标识相同但退款金额、退款原因、目标订单或操作类型不同返回 422 且不改变任何数据。
+  - 不携带 `Idempotency-Key` 时按普通单次操作处理（规则相同，仅不做请求标识去重与回放）。
+- `GET /orders/{order_id}/refunds`：按发生顺序读出该订单的每笔退款留痕（含被拒绝结论），字段含 `amount_cents`、`reason`、`result`（applied/rejected）、`reject_reason`、`paid_after`、`request_id`、`created_at`；不存在或跨租户返回 404。
 - `GET /health`：返回服务与数据库状态。
 
 幂等作用域为「租户 + 请求标识」：不同租户使用相同请求标识互不影响；幂等记录持久化在数据库中，服务重启后继续有效。
@@ -220,4 +250,4 @@ curl -s http://127.0.0.1:8000/orders/ord-fixed/corrections -H 'X-Tenant: tenant-
 - 单进程运行，单库写入；同标识并发通过 SQLite `BEGIN IMMEDIATE` 写事务串行化，库级锁保证只有一次请求产生业务效果。
 - 租户通过请求头声明，未接入真实身份提供方。
 - 无缓存层；批量导入为同步逐行受理，适合中小批量样本。
-- 收款支持多次登记、收款冲正、对账核销；仅尚无任何收款/冲正/核销业务事实的订单可更正；未实现分期单据、主动退款与自动对账。
+- 收款支持多次登记、收款冲正、对账核销与主动退款；仅尚无任何收款/冲正/核销/退款业务事实的订单可更正；未实现分期单据与自动对账。
