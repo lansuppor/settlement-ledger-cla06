@@ -12,6 +12,7 @@ from app.store.db import connect
 
 SCOPE_ORDER_CREATE = "order_create"
 SCOPE_PAYMENT = "payment"
+SCOPE_REVERSAL = "reversal"
 
 
 class IdempotentConflict(Exception):
@@ -84,7 +85,7 @@ def register_payment(tenant: str, request_id: str, order_id: str, amount_cents: 
 
         try:
             try:
-                body = orders.pay_conn(conn, tenant, order_id, amount_cents)
+                body = orders.pay_conn(conn, tenant, order_id, amount_cents, request_id)
                 status_code = 200
             except LookupError:
                 status_code, body = 404, {"detail": "order not found"}
@@ -92,6 +93,39 @@ def register_payment(tenant: str, request_id: str, order_id: str, amount_cents: 
                 status_code, body = 409, {"detail": str(error)}
             idempotency.insert_conn(
                 conn, tenant, request_id, SCOPE_PAYMENT, request_hash, order_id,
+                status_code, json.dumps(body, ensure_ascii=False),
+            )
+            _finish(conn)
+        except Exception:
+            _abort(conn)
+            raise
+    finally:
+        conn.close()
+    return IdemResult(status_code, body, replay=False)
+
+
+def reverse_payment(tenant: str, request_id: str, order_id: str, amount_cents: int) -> IdemResult:
+    request_hash = _fingerprint((SCOPE_REVERSAL, order_id, amount_cents))
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = idempotency.get_conn(conn, tenant, request_id)
+        if existing is not None:
+            _finish(conn)
+            if existing["scope"] != SCOPE_REVERSAL or existing["request_hash"] != request_hash:
+                raise IdempotentConflict("request id was already used with different request content")
+            return IdemResult(existing["status_code"], json.loads(existing["response_json"]), replay=True)
+
+        try:
+            try:
+                body = orders.reverse_conn(conn, tenant, order_id, amount_cents, request_id)
+                status_code = 200
+            except LookupError:
+                status_code, body = 404, {"detail": "order not found"}
+            except ValueError as error:
+                status_code, body = 409, {"detail": str(error)}
+            idempotency.insert_conn(
+                conn, tenant, request_id, SCOPE_REVERSAL, request_hash, order_id,
                 status_code, json.dumps(body, ensure_ascii=False),
             )
             _finish(conn)

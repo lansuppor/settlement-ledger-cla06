@@ -18,7 +18,21 @@ def connect() -> sqlite3.Connection:
 def migrate() -> None:
     conn = connect()
     try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations(version TEXT PRIMARY KEY)"
+        )
+        applied = {
+            row["version"]
+            for row in conn.execute("SELECT version FROM schema_migrations")
+        }
         for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+            if path.stem in applied:
+                continue
+            # 早期迁移只含 CREATE TABLE IF NOT EXISTS，重复执行无副作用；
+            # 含 ALTER TABLE 的迁移依赖版本记录保证只执行一次。
             conn.executescript(path.read_text(encoding="utf-8"))
+            conn.execute(
+                "INSERT INTO schema_migrations(version) VALUES(?)", (path.stem,)
+            )
     finally:
         conn.close()
